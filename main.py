@@ -17,6 +17,7 @@ https://github.com/piexian/astrbot_plugin_gif_to_video
 from __future__ import annotations
 
 import asyncio
+import io
 import threading
 import time
 from pathlib import Path
@@ -281,36 +282,38 @@ class GifVisionHelper(Star):
                 stem = main_path.stem
                 suffix = ".jpg"
 
-                first = True
-                real_count = 0
+                # 仅缓存第一帧 JPEG 字节，其他帧边读边写，避免按帧累积内存。
+                # 第一帧必须最后写回 main_path，防止覆盖原 GIF 后后续 seek 失败。
+                first_frame_bytes: Optional[bytes] = None
 
                 for frame_idx in indices:
                     try:
                         im.seek(frame_idx)
                         frame = im.convert("RGB")
+                        frame_resized = self._resize_frame(frame, max_side)
+
+                        if first_frame_bytes is None:
+                            buffer = io.BytesIO()
+                            frame_resized.save(buffer, format="JPEG", quality=90)
+                            first_frame_bytes = buffer.getvalue()
+                        else:
+                            out_path = parent / f"{stem}_f{frame_idx}{suffix}"
+                            frame_resized.save(out_path, format="JPEG", quality=90)
+                            paths.append(out_path)
+                            self._register_temp_file(out_path)
                     except (EOFError, UnidentifiedImageError):
                         # 某些 GIF 标记帧数比实际可读帧数多，跳过异常帧
                         continue
 
-                    frame_resized = self._resize_frame(frame, max_side)
-
-                    if first:
-                        out_path = main_path
-                        first = False
-                    else:
-                        out_path = parent / f"{stem}_f{frame_idx}{suffix}"
-
-                    frame_resized.save(out_path, format="JPEG", quality=90)
-                    paths.append(out_path)
-                    real_count += 1
-
-                    if out_path is not main_path:
-                        self._register_temp_file(out_path)
-
-                if not paths:
+                if first_frame_bytes is None:
                     return [], 0
 
-                return paths, real_count
+                # 最后再用第一帧覆盖原始文件，避免覆盖后丢失后续帧数据
+                with main_path.open("wb") as f:
+                    f.write(first_frame_bytes)
+                paths.insert(0, main_path)
+
+                return paths, len(paths)
 
         except DecompressionBombError as e:
             # 日志里的炸弹异常，现在只打 warning，不再一大坨 error+traceback
